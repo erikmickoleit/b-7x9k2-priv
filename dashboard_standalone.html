@@ -51,11 +51,13 @@ h2 { margin: 28px 0 12px 0; font-size: 13px; text-transform: uppercase;
               display: flex; flex-direction: column; gap: 2px; }
 .last-trade .lbl { text-transform: uppercase; font-size: 10px;
                    letter-spacing: 1px; color: #475569; }
-.cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.cards { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
 .card {
     background: #131826; border: 1px solid #1e2638;
     border-radius: 14px; padding: 14px;
+    min-width: 0;
 }
+.card .val { overflow-wrap: anywhere; }
 .card .lbl { font-size: 11px; color: #64748b;
               text-transform: uppercase; letter-spacing: 1px; }
 .card .val { font-size: 22px; font-weight: 600; margin-top: 4px; letter-spacing: -0.3px; }
@@ -65,14 +67,15 @@ h2 { margin: 28px 0 12px 0; font-size: 13px; text-transform: uppercase;
     border-radius: 14px; padding: 6px; margin-bottom: 14px;
 }
 #priceChart, #equityChart { width: 100%; height: 360px; }
+.compare { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
 @media (min-width: 700px) {
     body { max-width: 720px; margin: 0 auto; padding: 24px; }
-    .cards { grid-template-columns: repeat(4, 1fr); }
+    .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .compare { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     #priceChart, #equityChart { height: 460px; }
 }
 .foot { margin-top: 24px; font-size: 11px; color: #475569;
         text-align: center; padding-bottom: 30px; }
-.compare { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
 .loading { text-align: center; padding: 60px 20px; color: #64748b; font-size: 14px; }
 .spinner {
     width: 28px; height: 28px; border: 3px solid #1e2638;
