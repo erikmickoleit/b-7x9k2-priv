@@ -793,7 +793,8 @@ function render(state, metrics, bars, ma, portfolio, trades, comparisons) {
         <h2>Portfolio-Entwicklung</h2>
         <div class="chart-wrap"><div id="equityChart"></div></div>
         <div class="foot">
-            Live von Binance · ${new Date().toLocaleString()} ·
+            ${state.liveSource ? `Live-Spot via ${state.liveSource}` : "Daily-Close (yfinance)"} ·
+            ${new Date().toLocaleString()} ·
             <span class="refresh-btn" onclick="location.reload()">Refresh</span>
         </div>
     `;
@@ -935,9 +936,14 @@ async function main() {
                 : "Short-Position offen";
         }
 
+        setStatus("Live-Spotpreis…");
+        const live = await fetchLivePrice();
+
         const state = {
             date: lastBar.date,
             price: lastBar.close,
+            livePrice: live ? live.price : null,
+            liveSource: live ? live.source : null,
             ma: ma[lastIdx],
             distancePct: (lastBar.close - ma[lastIdx]) / ma[lastIdx] * 100,
             adx: isNaN(adx[lastIdx]) ? null : adx[lastIdx],
