@@ -281,6 +281,33 @@ async function fetchCoinbaseKlines() {
     return out;
 }
 
+async function fetchLivePrice() {
+    // Try Binance, Coinbase, CoinGecko for current BTC spot price.
+    const sources = [
+        ["Binance", "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
+            d => parseFloat(d.price)],
+        ["Coinbase", "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+            d => parseFloat(d.data?.amount)],
+        ["CoinGecko", "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
+            d => d?.bitcoin?.usd],
+    ];
+    for (const [name, url, parse] of sources) {
+        try {
+            const r = await fetchWithTimeout(url, 6000);
+            if (!r.ok) continue;
+            const d = await r.json();
+            const p = parse(d);
+            if (p && !isNaN(p) && p > 0) {
+                dbg(`Live price from ${name}: $${p.toLocaleString()}`);
+                return { price: p, source: name, fetched_at: new Date() };
+            }
+        } catch (e) {
+            dbg(`${name} live ticker failed: ${e.message}`);
+        }
+    }
+    return null;
+}
+
 async function fetchBakedHistory() {
     // Try to load pre-baked yfinance data from same origin.
     // Matches the Python backtest exactly. Falls through to live APIs on failure.
@@ -740,13 +767,18 @@ function render(state, metrics, bars, ma, portfolio, trades, comparisons) {
         : "";
 
     const root = document.getElementById("root");
+    const livePriceLine = state.livePrice
+        ? `<div class="price">$${state.livePrice.toLocaleString(undefined, { maximumFractionDigits: 0 })}<span style="font-size:13px;color:#94a3b8;font-weight:500;margin-left:8px;">live</span></div>
+           <div class="price-sub">Schluss ${state.date}: $${state.price.toLocaleString(undefined, { maximumFractionDigits: 0 })} · MA110 $${state.ma.toLocaleString(undefined, { maximumFractionDigits: 0 })} (${state.distancePct >= 0 ? "+" : ""}${state.distancePct.toFixed(1)}%)</div>`
+        : `<div class="price">$${state.price.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+           <div class="price-sub">BTC · ${state.date} · MA110 $${state.ma.toLocaleString(undefined, { maximumFractionDigits: 0 })} (${state.distancePct >= 0 ? "+" : ""}${state.distancePct.toFixed(1)}%)</div>`;
+
     root.innerHTML = `
         <div class="hero">
             <div class="pos-badge" style="background:${c}22;color:${c};border:1px solid ${c}44">
                 <span>${POS_EMOJI[state.position]}</span><span>${state.position}</span>
             </div>
-            <div class="price">$${state.price.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
-            <div class="price-sub">BTC · ${state.date} · MA110 $${state.ma.toLocaleString(undefined, { maximumFractionDigits: 0 })} (${state.distancePct >= 0 ? "+" : ""}${state.distancePct.toFixed(1)}%)</div>
+            ${livePriceLine}
             <div class="badges">${badges}</div>
             <div class="reason">${escapeHtml(state.reason)}</div>
             ${sl}
