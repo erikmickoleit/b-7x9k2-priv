@@ -234,42 +234,128 @@ async function fetchBybitKlines() {
     }));
 }
 
+async function fetchCoinbaseKlines() {
+    // Coinbase Exchange BTC-USD daily candles. Matches yfinance very closely.
+    // Max 300 candles per request; ts in SECONDS; returns DESCENDING.
+    setStatus("Coinbase BTC-USD…");
+    const all = [];
+    const startMs = new Date(CFG.start_date).getTime() - 200 * 86400000;
+    let cursorMs = startMs;
+    const PAGE_DAYS = 300;
+    const nowMs = Date.now();
+    let pages = 0;
+    while (cursorMs < nowMs && pages < 12) {
+        const endMs = Math.min(cursorMs + PAGE_DAYS * 86400000, nowMs);
+        const startISO = new Date(cursorMs).toISOString();
+        const endISO = new Date(endMs).toISOString();
+        const url = `https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400&start=${startISO}&end=${endISO}`;
+        setStatus(`Coinbase Page ${pages + 1} (${all.length} bars)…`);
+        const data = await fetchOnePage(url);
+        if (!Array.isArray(data) || data.length === 0) {
+            cursorMs = endMs + 86400000;
+            pages++;
+            continue;
+        }
+        // Coinbase returns [time, low, high, open, close, volume], DESC order
+        const sorted = data.slice().sort((a, b) => a[0] - b[0]);
+        for (const k of sorted) {
+            all.push({
+                ts: k[0] * 1000,
+                date: new Date(k[0] * 1000).toISOString().slice(0, 10),
+                low: k[1], high: k[2], open: k[3], close: k[4], volume: k[5],
+            });
+        }
+        cursorMs = endMs + 86400000;
+        pages++;
+        await sleep(250);
+    }
+    // Dedup by date
+    const seen = new Set();
+    const out = [];
+    for (const b of all) {
+        if (seen.has(b.date)) continue;
+        seen.add(b.date);
+        out.push(b);
+    }
+    out.sort((a, b) => a.ts - b.ts);
+    return out;
+}
+
+async function fetchBakedHistory() {
+    // Try to load pre-baked yfinance data from same origin.
+    // Matches the Python backtest exactly. Falls through to live APIs on failure.
+    setStatus("Lade gebackene Historie…");
+    const r = await fetchWithTimeout("./historic_data.json", 10000);
+    if (!r.ok) throw new Error(`historic_data.json HTTP ${r.status}`);
+    const data = await r.json();
+    if (!Array.isArray(data.bars) || data.bars.length < 200) {
+        throw new Error(`historic_data.json too small: ${data.bars?.length}`);
+    }
+    return { bars: data.bars, baked_at: data.baked_at, source: data.source };
+}
+
 async function fetchKlines() {
+    // 1. Try pre-baked yfinance JSON (matches Python backtest exactly).
+    try {
+        const baked = await fetchBakedHistory();
+        dbg(`Baked history: ${baked.bars.length} bars from ${baked.source} (baked ${baked.baked_at})`);
+        return baked.bars;
+    } catch (e) {
+        dbg(`Baked history not available: ${e.message}. Trying live APIs…`);
+    }
+    // 2. Coinbase
+    try {
+        const out = await fetchCoinbaseKlines();
+        if (out.length < 200) throw new Error(`only ${out.length} bars`);
+        dbg(`Coinbase: ${out.length} bars OK`);
+        return out;
+    } catch (e) {
+        dbg(`Coinbase failed: ${e.message}. Trying Binance…`);
+    }
+    // 3. Binance
     try {
         const out = await fetchBinanceKlines();
-        if (out.length < 200) throw new Error(`only ${out.length} bars from Binance`);
+        if (out.length < 200) throw new Error(`only ${out.length} bars`);
         dbg(`Binance: ${out.length} bars OK`);
         return out;
     } catch (e) {
         dbg(`Binance failed: ${e.message}. Trying Bybit…`);
-        const out = await fetchBybitKlines();
-        if (out.length < 200) throw new Error(`only ${out.length} bars from Bybit`);
-        dbg(`Bybit: ${out.length} bars OK`);
-        return out;
     }
+    // 4. Bybit
+    const out = await fetchBybitKlines();
+    if (out.length < 200) throw new Error(`only ${out.length} bars from Bybit`);
+    dbg(`Bybit: ${out.length} bars OK`);
+    return out;
 }
 
 // ====================================================================
 // INDICATORS (match Python implementations exactly)
 // ====================================================================
+// Pandas-equivalent: rolling window of length `period`, output NaN until all
+// `period` values in the window are non-NaN (matches pandas rolling().mean()
+// default with min_periods=period). NaN-aware running sum.
 function rollingMean(arr, period) {
     const out = new Array(arr.length).fill(NaN);
-    let sum = 0, count = 0;
+    let sum = 0, validInWindow = 0;
     for (let i = 0; i < arr.length; i++) {
-        sum += arr[i]; count++;
-        if (count > period) { sum -= arr[i - period]; count = period; }
-        if (count === period) out[i] = sum / period;
+        if (!isNaN(arr[i])) { sum += arr[i]; validInWindow++; }
+        if (i >= period) {
+            if (!isNaN(arr[i - period])) { sum -= arr[i - period]; validInWindow--; }
+        }
+        if (i >= period - 1 && validInWindow === period) out[i] = sum / period;
     }
     return out;
 }
 
 function rollingSum(arr, period) {
     const out = new Array(arr.length).fill(NaN);
-    let sum = 0, count = 0;
+    let sum = 0, validInWindow = 0;
     for (let i = 0; i < arr.length; i++) {
-        sum += arr[i] || 0; count++;
-        if (count > period) { sum -= arr[i - period] || 0; count = period; }
-        if (count === period) out[i] = sum;
+        if (!isNaN(arr[i])) { sum += arr[i]; validInWindow++; }
+        if (i >= period) {
+            if (!isNaN(arr[i - period])) { sum -= arr[i - period]; validInWindow--; }
+        }
+        if (i >= period - 1 && validInWindow === period) out[i] = sum;
     }
     return out;
 }
