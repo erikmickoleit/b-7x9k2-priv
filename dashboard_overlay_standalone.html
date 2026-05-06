@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>BTC L/S Overlay (Standalone)</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #0b1120; color: #e2e8f0;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    padding: 16px 18px 10px;
+    background: linear-gradient(180deg, #1e293b 0%, #0b1120 100%);
+    border-bottom: 1px solid #1e293b;
+  }
+  header h1 { margin: 0; font-size: 20px; font-weight: 600; }
+  header .sub { font-size: 12px; color: #94a3b8; margin-top: 2px; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px;
+          background: rgba(34,197,94,0.15); color: #22c55e; font-size: 11px;
+          font-weight: 500; margin-left: 6px; }
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; padding: 12px; }
+  .card { background: #131c2e; border: 1px solid #1e293b; border-radius: 10px;
+          padding: 10px 12px; min-height: 64px; }
+  .card .lbl { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; }
+  .card .val { font-size: 18px; font-weight: 600; margin-top: 2px; }
+  .card .sub { font-size: 11px; color: #64748b; margin-top: 1px; }
+  .chart { padding: 0 8px 8px; }
+  .chart h2 { margin: 14px 8px 6px; font-size: 13px; font-weight: 500; color: #cbd5e1; }
+  .footer { padding: 16px; font-size: 11px; color: #64748b; line-height: 1.5; }
+  #status { padding: 8px 18px; font-size: 11px; color: #64748b; min-height: 18px; }
+  #status.error { color: #ef4444; }
+  #dbg { padding: 6px 18px; font-size: 10px; color: #475569; max-height: 80px; overflow-y: auto;
+         font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<header>
+  <h1>BTC L/S Overlay <span class="pill">BOOST-ONLY</span></h1>
+  <div class="sub" id="hdr-sub">loading…</div>
+</header>
+
+<div id="status">Loading…</div>
+<div id="dbg"></div>
+
+<div class="grid" id="cards"></div>
+
+<div class="chart">
+  <h2>Price + MA110 + Trades (★ = boosted entry)</h2>
+  <div id="priceChart" style="height: 360px;"></div>
+</div>
+
+<div class="chart">
+  <h2>Equity: Overlay vs Baseline vs Buy&amp;Hold (log)</h2>
+  <div id="equityChart" style="height: 320px;"></div>
+</div>
+
+<div class="footer">
+  <strong>Final config:</strong> use_overlay=True, boost-only. PT/filter/fade-flip all off.
+  overlay_window_days=365, top_pct=0.90, bottom_pct=0.10, smooth=7, boost_mult=2.0.
+  Signals from Funding (Binance) + SOPR (bitcoin-data.com), Loose-AND, 7d smoothing.
+  <br><br>
+  <strong>Caveat:</strong> N=3 boosted trades in 6y backtest. ~70% of overlay alpha from one
+  single trade (2025-04-22 LONG +$3.82M). Treat as paper-trade until live data confirms.
+  <br><br>
+  Data baked daily. Live price ticker uses Binance/Bybit/Coinbase fallback.
+</div>
+
+<script>
+"use strict";
+// ====================================================================
+// CONFIG (mirrors overlay/core.py StrategyConfig — final tuned)
+// ====================================================================
+const CFG = {
+  start_date: "2020-04-01",
+  initial_investment: 1000,
+  ma_period: 110,
+  leverage_long: 3, leverage_short: 3, use_shorts: true,
+  reinvest_percent: 1.0, max_position_size: 1.6e10,
+  trading_fee: 0.001, slippage: 0.0005, tax_rate: 0.26,
+  use_stop_loss: true,
+  stop_loss_long: 0.05, stop_loss_short: 0.05,
+  adjust_stop_for_leverage: false,
+  stop_loss_slippage_factor: 0.5, min_stop_slippage: 0.001,
+  use_adx_filter: true, min_adx: 10, adx_period: 27, close_position_on_low_adx: true,
+  use_choppiness_filter: true, max_choppiness: 57, choppiness_period: 149, close_position_on_choppy: true,
+  use_er_filter: true, min_er: 0.01, er_period: 2, close_position_on_low_er: true,
+  // Overlay (boost-only)
+  use_overlay: true,
+  use_overlay_boost: true,
+  overlay_boost_mult: 2.0,
+  // Disabled
+  use_overlay_pt: false,
+  use_overlay_entry_gate: false,
+  use_overlay_force_close: false,
+  use_overlay_fade_flip: false,
+};
+
+const $ = s => document.querySelector(s);
+function setStatus(msg, isErr = false) { const e = $("#status"); e.textContent = msg; e.classList.toggle("error", isErr); }
+function dbg(msg) { const e = $("#dbg"); e.innerHTML += msg + "<br>"; e.scrollTop = e.scrollHeight; }
+
+// ====================================================================
+// INDICATORS
+// ====================================================================
+function rollingMean(arr, period) {
+  const out = new Array(arr.length).fill(NaN);
+  let sum = 0; let cnt = 0;
+  for (let i = 0; i < arr.length; i++) {
+    if (!isNaN(arr[i])) { sum += arr[i]; cnt++; }
+    if (i >= period && !isNaN(arr[i - period])) { sum -= arr[i - period]; cnt--; }
+    if (cnt === period) out[i] = sum / period;
+  }
+  return out;
+}
+
+function ema(arr, period) {
+  const out = new Array(arr.length).fill(NaN);
+  const k = 2 / (period + 1);
+  let prev = NaN;
+  for (let i = 0; i < arr.length; i++) {
+    const v = arr[i]; if (isNaN(v)) continue;
+    prev = isNaN(prev) ? v : v * k + prev * (1 - k);
+    out[i] = prev;
+  }
+  return out;
+}
+
+function calculateADX(bars, period) {
+  const n = bars.length;
+  const tr = new Array(n).fill(NaN), pdm = new Array(n).fill(NaN), ndm = new Array(n).fill(NaN);
+  for (let i = 1; i < n; i++) {
+    const h = bars[i].high, l = bars[i].low, pc = bars[i - 1].close;
+    tr[i] = Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
+    const upMove = bars[i].high - bars[i - 1].high;
+    const dnMove = bars[i - 1].low - bars[i].low;
+    pdm[i] = (upMove > dnMove && upMove > 0) ? upMove : 0;
+    ndm[i] = (dnMove > upMove && dnMove > 0) ? dnMove : 0;
+  }
+  const atr = ema(tr, period), pdmS = ema(pdm, period), ndmS = ema(ndm, period);
+  const pdi = atr.map((a, i) => isNaN(a) || a === 0 ? NaN : 100 * pdmS[i] / a);
+  const ndi = atr.map((a, i) => isNaN(a) || a === 0 ? NaN : 100 * ndmS[i] / a);
+  const dx = pdi.map((p, i) => {
+    const sum = p + ndi[i]; if (isNaN(sum) || sum === 0) return NaN;
+    return 100 * Math.abs(p - ndi[i]) / sum;
+  });
+  return ema(dx, period);
+}
+
+function calculateChoppiness(bars, period) {
+  const n = bars.length;
+  const tr = new Array(n).fill(NaN);
+  for (let i = 1; i < n; i++) {
+    const h = bars[i].high, l = bars[i].low, pc = bars[i - 1].close;
+    tr[i] = Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
+  }
+  const out = new Array(n).fill(NaN);
+  for (let i = period; i < n; i++) {
+    let sumTR = 0; let hi = -Infinity, lo = Infinity;
+    for (let j = i - period + 1; j <= i; j++) {
+      if (!isNaN(tr[j])) sumTR += tr[j];
+      hi = Math.max(hi, bars[j].high); lo = Math.min(lo, bars[j].low);
+    }
+    const range = hi - lo;
+    if (range > 0 && sumTR > 0) out[i] = 100 * Math.log10(sumTR / range) / Math.log10(period);
+  }
+  return out;
+}
+
+function calculateEfficiencyRatio(bars, period) {
+  const n = bars.length, out = new Array(n).fill(NaN);
+  for (let i = period; i < n; i++) {
+    const change = Math.abs(bars[i].close - bars[i - period].close);
+    let vol = 0;
+    for (let j = i - period + 1; j <= i; j++) vol += Math.abs(bars[j].close - bars[j - 1].close);
+    out[i] = vol > 0 ? change / vol : 0;
+  }
+  return out;
+}
+
+// ====================================================================
+// BACKTEST (mirrors overlay/core.py::run_backtest with boost-only overlay)
+// ====================================================================
+function runBacktest(bars, ma, adx, chop, er, cfg, useOverlay) {
+  const startIdx = bars.findIndex(b => b.date >= cfg.start_date);
+  const view = startIdx < 0 ? bars : bars.slice(startIdx);
+  const off = startIdx < 0 ? 0 : startIdx;
+
+  let cash = cfg.initial_investment;
+  let btc = 0, side = "none", entryPrice = 0, entryCapital = 0, currentLev = 1;
+  let stopPrice = null;
+  let prevPrice = null, prevMa = null;
+  const trades = [], portfolio = [];
+
+  const filtersAllow = (i) => {
+    const a = adx[i], c = chop[i], e = er[i];
+    if (cfg.use_adx_filter && (isNaN(a) || a < cfg.min_adx)) return false;
+    if (cfg.use_choppiness_filter && (isNaN(c) || c > cfg.max_choppiness)) return false;
+    if (cfg.use_er_filter && (isNaN(e) || e < cfg.min_er)) return false;
+    return true;
+  };
+  const filterClose = (i) => {
+    const a = adx[i], c = chop[i], e = er[i];
+    if (cfg.use_adx_filter && cfg.close_position_on_low_adx
+        && !isNaN(a) && a < cfg.min_adx) return `ADX=${a.toFixed(1)}<${cfg.min_adx}`;
+    if (cfg.use_choppiness_filter && cfg.close_position_on_choppy
+        && !isNaN(c) && c > cfg.max_choppiness) return `CHOP=${c.toFixed(1)}>${cfg.max_choppiness}`;
+    if (cfg.use_er_filter && cfg.close_position_on_low_er
+        && !isNaN(e) && e < cfg.min_er) return `ER=${e.toFixed(3)}<${cfg.min_er}`;
+    return null;
+  };
+  const stopFor = (entry, sd, lev) => {
+    let sl = sd === "long" ? cfg.stop_loss_long : cfg.stop_loss_short;
+    if (cfg.adjust_stop_for_leverage) sl /= lev;
+    return sd === "long" ? entry * (1 - sl) : entry * (1 + sl);
+  };
+
+  // Helper: open with boost when overlay+signal active
+  const openLong = (bar) => {
+    const boost = (useOverlay && cfg.use_overlay_boost && bar.bottom_signal) ? cfg.overlay_boost_mult : 1.0;
+    currentLev = cfg.leverage_long * boost;
+    entryCapital = Math.min(cash * cfg.reinvest_percent, cfg.max_position_size / currentLev);
+    const eff = bar.close * (1 + cfg.slippage + cfg.trading_fee);
+    btc = (entryCapital * currentLev) / eff;
+    entryPrice = eff; side = "long";
+    stopPrice = cfg.use_stop_loss ? stopFor(entryPrice, "long", currentLev) : null;
+    const t = { date: bar.date, action: "OPEN_LONG", price: bar.close, effectivePrice: eff,
+                leverage: currentLev, stop_loss: stopPrice };
+    if (boost > 1.0) { t.boost_applied = true; t.overlay = true; }
+    trades.push(t);
+  };
+  const openShort = (bar) => {
+    const boost = (useOverlay && cfg.use_overlay_boost && bar.top_signal) ? cfg.overlay_boost_mult : 1.0;
+    currentLev = cfg.leverage_short * boost;
+    entryCapital = Math.min(cash * cfg.reinvest_percent, cfg.max_position_size / currentLev);
+    const eff = bar.close * (1 - cfg.slippage - cfg.trading_fee);
+    btc = (entryCapital * currentLev) / eff;
+    entryPrice = eff; side = "short";
+    stopPrice = cfg.use_stop_loss ? stopFor(entryPrice, "short", currentLev) : null;
+    const t = { date: bar.date, action: "OPEN_SHORT", price: bar.close, effectivePrice: eff,
+                leverage: currentLev, stop_loss: stopPrice };
+    if (boost > 1.0) { t.boost_applied = true; t.overlay = true; }
+    trades.push(t);
+  };
+
+  for (let k = 0; k < view.length; k++) {
+    const i = off + k;
+    const bar = view[k];
+    const price = bar.close, low = bar.low, high = bar.high;
+    const maVal = ma[i];
+
+    if (isNaN(maVal)) { portfolio.push(cash); prevPrice = price; prevMa = NaN; continue; }
+    if (isNaN(prevMa)) { portfolio.push(cash); prevPrice = price; prevMa = maVal; continue; }
+
+    if (side !== "none" && stopPrice !== null && cfg.use_stop_loss) {
+      let hit = false, execP = 0;
+      if (side === "long" && low <= stopPrice) {
+        hit = true;
+        execP = low < stopPrice
+            ? stopPrice - (stopPrice - low) * cfg.stop_loss_slippage_factor
+            : stopPrice * (1 - cfg.min_stop_slippage);
+      } else if (side === "short" && high >= stopPrice) {
+        hit = true;
+        execP = high > stopPrice
+            ? stopPrice + (high - stopPrice) * cfg.stop_loss_slippage_factor
+            : stopPrice * (1 + cfg.min_stop_slippage);
+      }
+      if (hit) {
+        const fee = cfg.slippage + cfg.trading_fee;
+        const eff = side === "long" ? execP * (1 - fee) : execP * (1 + fee);
+        const pnl = side === "long" ? btc * eff - entryCapital * currentLev : (entryPrice - eff) * btc;
+        cash += pnl;
+        trades.push({ date: bar.date, action: `STOP_LOSS_${side.toUpperCase()}`,
+                      price, executionPrice: execP, pnl });
+        btc = 0; side = "none"; stopPrice = null;
+      }
+    }
+
+    if (side !== "none" && currentLev > 1) {
+      const liq = side === "long" ? entryPrice * (1 - 1 / currentLev) : entryPrice * (1 + 1 / currentLev);
+      if ((side === "long" && low <= liq) || (side === "short" && high >= liq)) {
+        trades.push({ date: bar.date, action: "LIQUIDATION", price });
+        cash -= entryCapital;
+        btc = 0; side = "none"; stopPrice = null;
+        portfolio.push(cash);
+        prevPrice = price; prevMa = maVal;
+        continue;
+      }
+    }
+
+    const crossedUp = prevPrice < prevMa && price > maVal;
+    const crossedDown = prevPrice > prevMa && price < maVal;
+    const allow = filtersAllow(i);
+    const closeReason = side !== "none" ? filterClose(i) : null;
+
+    if (closeReason !== null) {
+      const fee = cfg.slippage + cfg.trading_fee;
+      const eff = side === "long" ? price * (1 - fee) : price * (1 + fee);
+      const pnl = side === "long" ? btc * eff - entryCapital * currentLev : (entryPrice - eff) * btc;
+      cash += pnl;
+      trades.push({ date: bar.date, action: `CLOSE_${side.toUpperCase()}`,
+                    price, effectivePrice: eff, pnl, reason: closeReason });
+      btc = 0; side = "none"; stopPrice = null;
+    }
+
+    if (side === "none" && crossedUp && cash > 0 && allow) openLong(bar);
+    else if (side === "none" && crossedDown && cfg.use_shorts && cash > 0 && allow) openShort(bar);
+    else if (side === "long" && crossedDown) {
+      const eff = price * (1 - cfg.slippage - cfg.trading_fee);
+      const pnl = btc * eff - entryCapital * currentLev;
+      cash += pnl;
+      trades.push({ date: bar.date, action: "CLOSE_LONG", price, effectivePrice: eff, pnl });
+      btc = 0; side = "none"; stopPrice = null;
+      if (cfg.use_shorts && cash > 0) openShort(bar);
+    } else if (side === "short" && crossedUp) {
+      const eff = price * (1 + cfg.slippage + cfg.trading_fee);
+      const pnl = (entryPrice - eff) * btc;
+      cash += pnl;
+      trades.push({ date: bar.date, action: "CLOSE_SHORT", price, effectivePrice: eff, pnl });
+      btc = 0; side = "none"; stopPrice = null;
+      if (cash > 0) openLong(bar);
+    }
+
+    // Tax accrual (April 1)
+    const d = new Date(bar.ts);
+    if (d.getUTCMonth() === 3 && d.getUTCDate() === 1) {
+      const year = d.getUTCFullYear();
+      let yearly = 0;
+      for (const t of trades) {
+        if (t.pnl !== undefined && new Date(t.date).getUTCFullYear() === year - 1) yearly += t.pnl;
+      }
+      if (yearly > 0) {
+        const tax = yearly * cfg.tax_rate;
+        cash -= tax;
+        trades.push({ date: bar.date, action: "TAX_PAYMENT", year: year - 1, tax, yearly_pnl: yearly });
+      }
+    }
+
+    let val;
+    if (side === "long") val = Math.max(0, btc * price - entryCapital * (currentLev - 1));
+    else if (side === "short") val = Math.max(0, cash + (entryPrice - price) * btc);
+    else val = cash;
+    portfolio.push(val);
+
+    prevPrice = price; prevMa = maVal;
+  }
+
+  return { trades, portfolio, view, off, finalSide: side, finalCash: cash };
+}
+
+// ====================================================================
+// METRICS
+// ====================================================================
+function metrics(portfolio, trades, cfg, nDays) {
+  const n = portfolio.length;
+  if (n < 2) return null;
+  const final = portfolio[n - 1];
+  const initial = cfg.initial_investment;
+  const totalRet = (final / initial - 1) * 100;
+  const years = nDays / 365.25;
+  const annRet = years > 0 ? (Math.pow(final / initial, 1 / years) - 1) * 100 : 0;
+  const daily = [];
+  for (let i = 1; i < n; i++) daily.push(portfolio[i] / portfolio[i - 1] - 1);
+  const mean = daily.reduce((a, b) => a + b, 0) / daily.length;
+  const variance = daily.reduce((s, v) => s + (v - mean) ** 2, 0) / daily.length;
+  const std = Math.sqrt(variance);
+  const sharpe = std > 0 ? (mean - cfg.risk_free_rate / 365.25) / std * Math.sqrt(365.25) : 0;
+  // MaxDD
+  let peak = portfolio[0], maxDD = 0;
+  for (const v of portfolio) { peak = Math.max(peak, v); maxDD = Math.min(maxDD, (v - peak) / peak); }
+  return { final, totalRet, annRet, sharpe, maxDD: maxDD * 100, nTrades: trades.filter(t => t.action.startsWith("OPEN_")).length };
+}
+
+// ====================================================================
+// FETCH baked overlay data
+// ====================================================================
+async function fetchOverlayData() {
+  setStatus("Loading overlay_data.json…");
+  const r = await fetch("./overlay_data.json", { cache: "no-store" });
+  if (!r.ok) throw new Error(`overlay_data.json HTTP ${r.status}`);
+  const d = await r.json();
+  dbg(`Loaded overlay_data.json: ${d.bars.length} bars, baked ${d.baked_at}`);
+  return d;
+}
+
+// Live price ticker
+async function fetchLivePrice() {
+  const sources = [
+    { name: "binance", url: "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", parse: r => +r.price },
+    { name: "bybit",   url: "https://api.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT",
+      parse: r => +r.result.list[0].lastPrice },
+    { name: "coinbase",url: "https://api.coinbase.com/v2/prices/BTC-USD/spot", parse: r => +r.data.amount },
+  ];
+  for (const s of sources) {
+    try {
+      const r = await fetch(s.url, { cache: "no-store" });
+      if (!r.ok) continue;
+      const j = await r.json();
+      const p = s.parse(j);
+      if (isFinite(p) && p > 0) return { price: p, source: s.name };
+    } catch (e) { dbg(`live ${s.name}: ${e.message}`); }
+  }
+  return null;
+}
+
+// ====================================================================
+// MAIN
+// ====================================================================
+(async () => {
+  try {
+    const data = await fetchOverlayData();
+    const bars = data.bars;
+    setStatus(`Computing indicators (${bars.length} bars)…`);
+
+    const close = bars.map(b => b.close);
+    const ma = rollingMean(close, CFG.ma_period);
+    const adx = calculateADX(bars, CFG.adx_period);
+    const chop = calculateChoppiness(bars, CFG.choppiness_period);
+    const er = calculateEfficiencyRatio(bars, CFG.er_period);
+
+    setStatus("Running backtests (overlay + baseline)…");
+    const overlay = runBacktest(bars, ma, adx, chop, er, CFG, true);
+    const baseline = runBacktest(bars, ma, adx, chop, er, CFG, false);
+
+    const view = overlay.view;
+    const offIdx = overlay.off;
+    const nDays = view.length;
+    const mO = metrics(overlay.portfolio, overlay.trades, CFG, nDays);
+    const mB = metrics(baseline.portfolio, baseline.trades, CFG, nDays);
+
+    const lastBar = view[view.length - 1];
+    const live = await fetchLivePrice();
+    const liveTxt = live ? `live $${live.price.toLocaleString(undefined, {maximumFractionDigits:0})} via ${live.source}` : "(live fetch failed)";
+    $("#hdr-sub").textContent = `${data.n_bars} bars · ${view[0].date} → ${lastBar.date} · ${liveTxt}`;
+
+    // Determine current position from latest trade
+    let curSide = "FLAT", curEmoji = "—", curColor = "#94a3b8";
+    for (let i = overlay.trades.length - 1; i >= 0; i--) {
+      const a = overlay.trades[i].action;
+      if (a === "OPEN_LONG") { curSide = "LONG"; curEmoji = "▲"; curColor = "#22c55e"; break; }
+      if (a === "OPEN_SHORT") { curSide = "SHORT"; curEmoji = "▼"; curColor = "#ef4444"; break; }
+      if (a.startsWith("CLOSE_") || a.startsWith("STOP_") || a === "LIQUIDATION") { curSide = "FLAT"; break; }
+    }
+
+    const nBoosts = overlay.trades.filter(t => t.boost_applied).length;
+    const cards = [
+      { lbl: "Position", val: `${curEmoji} ${curSide}`, sub: `@ $${lastBar.close.toLocaleString(undefined,{maximumFractionDigits:0})} (${lastBar.date})`, color: curColor },
+      { lbl: "Sharpe (Overlay)", val: mO.sharpe.toFixed(2), sub: `baseline ${mB.sharpe.toFixed(2)}`, color: "#22c55e" },
+      { lbl: "CAGR (Overlay)", val: mO.annRet.toFixed(0) + "%", sub: `baseline ${mB.annRet.toFixed(0)}%` },
+      { lbl: "MaxDD", val: mO.maxDD.toFixed(1) + "%", sub: `baseline ${mB.maxDD.toFixed(1)}%`, color: "#ef4444" },
+      { lbl: "Final $", val: "$" + Math.round(mO.final).toLocaleString(), sub: `baseline $${Math.round(mB.final).toLocaleString()}` },
+      { lbl: "Trades", val: `${mO.nTrades}`, sub: `${nBoosts} boosted (2.0×)` },
+    ];
+    $("#cards").innerHTML = cards.map(c =>
+      `<div class="card"><div class="lbl">${c.lbl}</div>` +
+      `<div class="val"${c.color ? ' style="color:' + c.color + '"' : ''}>${c.val}</div>` +
+      `<div class="sub">${c.sub}</div></div>`).join("");
+
+    // Build trade-marker arrays
+    const dates = view.map(b => b.date);
+    const tradesByAction = (acts, requireBoost) => overlay.trades
+      .filter(t => acts.includes(t.action) && (!requireBoost || t.boost_applied))
+      .map(t => ({ date: t.date.slice(0, 10), price: t.effectivePrice || t.executionPrice || t.price }));
+
+    const ol = tradesByAction(["OPEN_LONG"], false);
+    const olBoost = tradesByAction(["OPEN_LONG"], true);
+    const cl = tradesByAction(["CLOSE_LONG", "STOP_LOSS_LONG"], false);
+    const os = tradesByAction(["OPEN_SHORT"], false);
+    const osBoost = tradesByAction(["OPEN_SHORT"], true);
+    const cs = tradesByAction(["CLOSE_SHORT", "STOP_LOSS_SHORT"], false);
+
+    const layoutBase = {
+      paper_bgcolor: "#0b1120", plot_bgcolor: "#0b1120",
+      font: { color: "#cbd5e1", size: 11 },
+      margin: { t: 6, r: 8, b: 28, l: 50 },
+      xaxis: { gridcolor: "#1e293b", zeroline: false, color: "#94a3b8" },
+      yaxis: { gridcolor: "#1e293b", zeroline: false, color: "#94a3b8" },
+      legend: { orientation: "h", x: 0, y: 1.08, font: { size: 10 } },
+      hovermode: "x unified",
+    };
+
+    const priceTraces = [
+      { x: dates, y: view.map(b => b.close), name: "BTC", line: { color: "#fbbf24", width: 1.4 }, type: "scatter" },
+      { x: dates, y: view.map((_, k) => ma[offIdx + k]), name: "MA110", line: { color: "#60a5fa", width: 1.2, dash: "dot" }, type: "scatter" },
+      { x: ol.map(t => t.date), y: ol.map(t => t.price), name: "Open Long", mode: "markers",
+        marker: { color: "#22c55e", size: 8, symbol: "triangle-up" }, type: "scatter" },
+      { x: olBoost.map(t => t.date), y: olBoost.map(t => t.price), name: "BOOST Long", mode: "markers",
+        marker: { color: "#22c55e", size: 18, symbol: "star", line: { width: 2, color: "#fff" } }, type: "scatter" },
+      { x: cl.map(t => t.date), y: cl.map(t => t.price), name: "Close Long", mode: "markers",
+        marker: { color: "#16a34a", size: 6, symbol: "x" }, type: "scatter" },
+      { x: os.map(t => t.date), y: os.map(t => t.price), name: "Open Short", mode: "markers",
+        marker: { color: "#ef4444", size: 8, symbol: "triangle-down" }, type: "scatter" },
+      { x: osBoost.map(t => t.date), y: osBoost.map(t => t.price), name: "BOOST Short", mode: "markers",
+        marker: { color: "#ef4444", size: 18, symbol: "star", line: { width: 2, color: "#fff" } }, type: "scatter" },
+      { x: cs.map(t => t.date), y: cs.map(t => t.price), name: "Close Short", mode: "markers",
+        marker: { color: "#dc2626", size: 6, symbol: "x" }, type: "scatter" },
+    ];
+    Plotly.newPlot("priceChart", priceTraces, {
+      ...layoutBase,
+      yaxis: { ...layoutBase.yaxis, type: "log", title: "USD (log)" },
+    }, { responsive: true, displayModeBar: false });
+
+    const bh = view.map(b => CFG.initial_investment / view[0].close * b.close);
+    const equityTraces = [
+      { x: dates, y: overlay.portfolio, name: "Overlay (Boost)",
+        line: { color: "#22c55e", width: 2 }, type: "scatter", fill: "tozeroy", fillcolor: "rgba(34,197,94,0.10)" },
+      { x: dates, y: baseline.portfolio, name: "Baseline (no overlay)",
+        line: { color: "#60a5fa", width: 1.6, dash: "dash" }, type: "scatter" },
+      { x: dates, y: bh, name: "Buy & Hold",
+        line: { color: "#94a3b8", width: 1.2, dash: "dot" }, type: "scatter" },
+    ];
+    Plotly.newPlot("equityChart", equityTraces, {
+      ...layoutBase,
+      yaxis: { ...layoutBase.yaxis, type: "log", title: "USD (log)" },
+    }, { responsive: true, displayModeBar: false });
+
+    setStatus(`Done · overlay Sharpe ${mO.sharpe.toFixed(2)} vs baseline ${mB.sharpe.toFixed(2)} · ${nBoosts} boosts`);
+  } catch (e) {
+    setStatus("Error: " + e.message, true);
+    dbg("ERROR: " + (e.stack || e.message));
+  }
+})();
+</script>
+</body>
+</html>
