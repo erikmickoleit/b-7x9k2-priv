@@ -85,6 +85,53 @@ def fetch_sopr_history() -> list[dict]:
 
 
 # ----- Signal computation (inline) ----------------------------------------------
+def calculate_adx(df: pd.DataFrame, period: int = 27) -> pd.Series:
+    """Mirrors strategy/indicators.py — SMA-based ADX (NOT Wilder EMA)."""
+    high, low, close = df["high"], df["low"], df["close"]
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    plus_dm = high - high.shift(1)
+    minus_dm = low.shift(1) - low
+    plus_dm = plus_dm.copy()
+    minus_dm = minus_dm.copy()
+    plus_dm[plus_dm < 0] = 0
+    minus_dm[minus_dm < 0] = 0
+    plus_dm[plus_dm < minus_dm] = 0
+    minus_dm[minus_dm < plus_dm] = 0
+
+    atr = tr.rolling(period).mean()
+    plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
+    minus_di = 100 * (minus_dm.rolling(period).mean() / atr)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    return dx.rolling(period).mean()
+
+
+def calculate_choppiness(df: pd.DataFrame, period: int = 149) -> pd.Series:
+    """Mirrors strategy/indicators.py."""
+    high, low, close = df["high"], df["low"], df["close"]
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr_sum = tr.rolling(period).sum()
+    high_max = high.rolling(period).max()
+    low_min = low.rolling(period).min()
+    hl_range = high_max - low_min
+    return 100 * np.log10(atr_sum / hl_range) / np.log10(period)
+
+
+def calculate_efficiency_ratio(df: pd.DataFrame, period: int = 2) -> pd.Series:
+    """Mirrors strategy/indicators.py — fillna(0)."""
+    close = df["close"]
+    change = (close - close.shift(period)).abs()
+    volatility = close.diff().abs().rolling(period).sum()
+    er = change / volatility
+    return er.fillna(0)
+
+
 def compute_signals_inline(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     w, smooth = OVERLAY_WINDOW_DAYS, OVERLAY_SMOOTH_DAYS
@@ -137,8 +184,17 @@ def main() -> None:
     df["funding"] = df["date"].map(f_map).astype(float)
     df["sopr"] = df["date"].map(s_map).astype(float)
 
+    print("Computing indicators (MA110, ADX, CHOP, ER)...")
+    df["ma110"] = df["close"].rolling(110).mean()
+    df["adx"] = calculate_adx(df, period=27)
+    df["chop"] = calculate_choppiness(df, period=149)
+    df["er"] = calculate_efficiency_ratio(df, period=2)
+
     print("Computing overlay signals...")
     df = compute_signals_inline(df)
+
+    def _f(v):
+        return None if pd.isna(v) else float(v)
 
     bars = []
     for _, row in df.iterrows():
@@ -150,12 +206,16 @@ def main() -> None:
             "low": float(row["low"]),
             "close": float(row["close"]),
             "volume": float(row["volume"]),
-            "funding": None if pd.isna(row["funding"]) else float(row["funding"]),
-            "sopr": None if pd.isna(row["sopr"]) else float(row["sopr"]),
-            "funding_pct": None if pd.isna(row["funding_pct"]) else float(row["funding_pct"]),
-            "sopr_pct": None if pd.isna(row["sopr_pct"]) else float(row["sopr_pct"]),
+            "funding": _f(row["funding"]),
+            "sopr": _f(row["sopr"]),
+            "funding_pct": _f(row["funding_pct"]),
+            "sopr_pct": _f(row["sopr_pct"]),
             "top_signal": bool(row["top_signal"]),
             "bottom_signal": bool(row["bottom_signal"]),
+            "ma110": _f(row["ma110"]),
+            "adx": _f(row["adx"]),
+            "chop": _f(row["chop"]),
+            "er": _f(row["er"]),
         })
 
     out = {

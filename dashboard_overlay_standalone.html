@@ -79,6 +79,7 @@ const CFG = {
   start_date: "2020-04-01",
   initial_investment: 1000,
   ma_period: 110,
+  risk_free_rate: 0.04,
   leverage_long: 3, leverage_short: 3, use_shorts: true,
   reinvest_percent: 1.0, max_position_size: 1.6e10,
   trading_fee: 0.001, slippage: 0.0005, tax_rate: 0.26,
@@ -105,85 +106,9 @@ function setStatus(msg, isErr = false) { const e = $("#status"); e.textContent =
 function dbg(msg) { const e = $("#dbg"); e.innerHTML += msg + "<br>"; e.scrollTop = e.scrollHeight; }
 
 // ====================================================================
-// INDICATORS
-// ====================================================================
-function rollingMean(arr, period) {
-  const out = new Array(arr.length).fill(NaN);
-  let sum = 0; let cnt = 0;
-  for (let i = 0; i < arr.length; i++) {
-    if (!isNaN(arr[i])) { sum += arr[i]; cnt++; }
-    if (i >= period && !isNaN(arr[i - period])) { sum -= arr[i - period]; cnt--; }
-    if (cnt === period) out[i] = sum / period;
-  }
-  return out;
-}
-
-function ema(arr, period) {
-  const out = new Array(arr.length).fill(NaN);
-  const k = 2 / (period + 1);
-  let prev = NaN;
-  for (let i = 0; i < arr.length; i++) {
-    const v = arr[i]; if (isNaN(v)) continue;
-    prev = isNaN(prev) ? v : v * k + prev * (1 - k);
-    out[i] = prev;
-  }
-  return out;
-}
-
-function calculateADX(bars, period) {
-  const n = bars.length;
-  const tr = new Array(n).fill(NaN), pdm = new Array(n).fill(NaN), ndm = new Array(n).fill(NaN);
-  for (let i = 1; i < n; i++) {
-    const h = bars[i].high, l = bars[i].low, pc = bars[i - 1].close;
-    tr[i] = Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
-    const upMove = bars[i].high - bars[i - 1].high;
-    const dnMove = bars[i - 1].low - bars[i].low;
-    pdm[i] = (upMove > dnMove && upMove > 0) ? upMove : 0;
-    ndm[i] = (dnMove > upMove && dnMove > 0) ? dnMove : 0;
-  }
-  const atr = ema(tr, period), pdmS = ema(pdm, period), ndmS = ema(ndm, period);
-  const pdi = atr.map((a, i) => isNaN(a) || a === 0 ? NaN : 100 * pdmS[i] / a);
-  const ndi = atr.map((a, i) => isNaN(a) || a === 0 ? NaN : 100 * ndmS[i] / a);
-  const dx = pdi.map((p, i) => {
-    const sum = p + ndi[i]; if (isNaN(sum) || sum === 0) return NaN;
-    return 100 * Math.abs(p - ndi[i]) / sum;
-  });
-  return ema(dx, period);
-}
-
-function calculateChoppiness(bars, period) {
-  const n = bars.length;
-  const tr = new Array(n).fill(NaN);
-  for (let i = 1; i < n; i++) {
-    const h = bars[i].high, l = bars[i].low, pc = bars[i - 1].close;
-    tr[i] = Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
-  }
-  const out = new Array(n).fill(NaN);
-  for (let i = period; i < n; i++) {
-    let sumTR = 0; let hi = -Infinity, lo = Infinity;
-    for (let j = i - period + 1; j <= i; j++) {
-      if (!isNaN(tr[j])) sumTR += tr[j];
-      hi = Math.max(hi, bars[j].high); lo = Math.min(lo, bars[j].low);
-    }
-    const range = hi - lo;
-    if (range > 0 && sumTR > 0) out[i] = 100 * Math.log10(sumTR / range) / Math.log10(period);
-  }
-  return out;
-}
-
-function calculateEfficiencyRatio(bars, period) {
-  const n = bars.length, out = new Array(n).fill(NaN);
-  for (let i = period; i < n; i++) {
-    const change = Math.abs(bars[i].close - bars[i - period].close);
-    let vol = 0;
-    for (let j = i - period + 1; j <= i; j++) vol += Math.abs(bars[j].close - bars[j - 1].close);
-    out[i] = vol > 0 ? change / vol : 0;
-  }
-  return out;
-}
-
-// ====================================================================
 // BACKTEST (mirrors overlay/core.py::run_backtest with boost-only overlay)
+// Uses pre-baked indicators (ma110, adx, chop, er) from overlay_data.json
+// to guarantee numerical parity with the Python pipeline.
 // ====================================================================
 function runBacktest(bars, ma, adx, chop, er, cfg, useOverlay) {
   const startIdx = bars.findIndex(b => b.date >= cfg.start_date);
@@ -416,11 +341,11 @@ async function fetchLivePrice() {
     const bars = data.bars;
     setStatus(`Computing indicators (${bars.length} bars)…`);
 
-    const close = bars.map(b => b.close);
-    const ma = rollingMean(close, CFG.ma_period);
-    const adx = calculateADX(bars, CFG.adx_period);
-    const chop = calculateChoppiness(bars, CFG.choppiness_period);
-    const er = calculateEfficiencyRatio(bars, CFG.er_period);
+    // Use pre-baked indicators from JSON to guarantee Python-parity (no JS-side recompute drift)
+    const ma = bars.map(b => b.ma110 == null ? NaN : b.ma110);
+    const adx = bars.map(b => b.adx == null ? NaN : b.adx);
+    const chop = bars.map(b => b.chop == null ? NaN : b.chop);
+    const er = bars.map(b => b.er == null ? NaN : b.er);
 
     setStatus("Running backtests (overlay + baseline)…");
     const overlay = runBacktest(bars, ma, adx, chop, er, CFG, true);
